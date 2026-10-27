@@ -1,0 +1,140 @@
+# =====================================================================
+# Docker Compose do Transactional Outbox Pattern Demo.
+#
+# Serviços: postgres, rabbitmq, api, worker, consumer.
+# Subir tudo:   docker compose up --build -d
+# Acompanhar:   docker compose logs -f api worker consumer
+#
+# Credenciais locais (documentadas):
+#   PostgreSQL -> usuário: postgres | senha: postgres | db: outbox
+#   RabbitMQ   -> usuário: guest    | senha: guest
+#   RabbitMQ Management UI: http://localhost:15672
+# =====================================================================
+
+services:
+  # -------------------- PostgreSQL --------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: outbox_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: outbox
+    ports:
+      # Porta externa configurável via POSTGRES_PORT (padrão 5432).
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Script executado automaticamente na primeira inicialização.
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d outbox"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------- RabbitMQ --------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: outbox_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # -------------------- API --------------------
+  api:
+    build:
+      context: .
+      args:
+        APP: api
+    container_name: outbox_api
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: outbox
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      API_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Cenário 3 (ROLLBACK): mude para true e recrie o serviço para demonstrar.
+      SIMULATE_API_FAILURE: ${SIMULATE_API_FAILURE:-false}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------- Outbox Worker --------------------
+  worker:
+    build:
+      context: .
+      args:
+        APP: worker
+    container_name: outbox_worker
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: outbox
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_EXCHANGE: orders.exchange
+      RABBITMQ_QUEUE: orders.created.queue
+      RABBITMQ_ROUTING_KEY: order.created
+      OUTBOX_POLLING_INTERVAL_MS: ${OUTBOX_POLLING_INTERVAL_MS:-2000}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-10}
+      OUTBOX_LEASE_DURATION_MS: ${OUTBOX_LEASE_DURATION_MS:-30000}
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-5}
+      OUTBOX_RETRY_BACKOFF_BASE_MS: ${OUTBOX_RETRY_BACKOFF_BASE_MS:-2000}
+      OUTBOX_RETRY_BACKOFF_MAX_MS: ${OUTBOX_RETRY_BACKOFF_MAX_MS:-60000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Cenário 4 (duplicidade): mude para true e recrie para demonstrar.
+      SIMULATE_CRASH_AFTER_CONFIRM: ${SIMULATE_CRASH_AFTER_CONFIRM:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------- Consumer --------------------
+  consumer:
+    build:
+      context: .
+      args:
+        APP: consumer
+    container_name: outbox_consumer
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: outbox
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_EXCHANGE: orders.exchange
+      RABBITMQ_QUEUE: orders.created.queue
+      RABBITMQ_ROUTING_KEY: order.created
+      CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
